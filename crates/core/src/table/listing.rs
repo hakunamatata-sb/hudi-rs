@@ -185,9 +185,14 @@ impl FileLister {
             .filter(|dir| !LAKE_FORMAT_METADATA_DIRS.contains(&dir.as_str()))
             .collect();
 
+        let should_descend = |prefix: &str| self.partition_pruner.should_include_prefix(prefix);
+
         let mut partition_paths = Vec::new();
         for dir in top_level_dirs {
-            partition_paths.extend(get_leaf_dirs(&self.storage, Some(&dir)).await?);
+            if !should_descend(&dir) {
+                continue;
+            }
+            partition_paths.extend(get_leaf_dirs(&self.storage, Some(&dir), &should_descend).await?);
         }
 
         if partition_paths.is_empty() || self.partition_pruner.is_empty() {
@@ -309,6 +314,61 @@ mod test {
                 "byteField=30/shortField=100"
             ])
         )
+    }
+
+    /// Regression test for descent-time partition pruning: a selective filter
+    /// must skip the storage `list` calls under directories it already rules
+    /// out, not merely filter the leaf paths after every directory is listed.
+    ///
+    /// For `V6ComplexkeygenHivestyle` (3 leaf partitions under two hive-style
+    /// levels, `byteField`/`shortField`), an unfiltered run issues 7 `list`
+    /// calls: 1 for the top-level `byteField=*` dirs, then for each of the 3,
+    /// 1 to find its `shortField=*` child and 1 more on that leaf to confirm
+    /// it has no children. A filter matching only `byteField=10` issues 3:
+    /// the same unavoidable top-level call, then only `byteField=10`'s two
+    /// levels are ever listed — `byteField=20`/`byteField=30` are pruned
+    /// before incurring any `list` call under them.
+    #[tokio::test]
+    async fn partition_filter_pruning_reduces_storage_list_calls() {
+        use crate::storage::counting::CountingObjectStore;
+        use object_store::local::LocalFileSystem;
+
+        let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let hudi_configs = hudi_table.hudi_configs.clone();
+        let partition_schema = hudi_table.get_partition_schema().await.unwrap();
+
+        let list_calls_for = |pruner: PartitionPruner| {
+            let base_url = base_url.clone();
+            let hudi_configs = hudi_configs.clone();
+            async move {
+                let (object_store, counts) =
+                    CountingObjectStore::new(Arc::new(LocalFileSystem::new()));
+                let storage =
+                    Storage::new_with_object_store(base_url, object_store, hudi_configs);
+                let lister = FileLister::new(storage.hudi_configs.clone(), storage, pruner);
+                let partition_paths = lister.list_relevant_partition_paths().await.unwrap();
+                (partition_paths.len(), counts.lists())
+            }
+        };
+
+        let (unfiltered_partitions, unfiltered_lists) =
+            list_calls_for(PartitionPruner::empty()).await;
+        assert_eq!(unfiltered_partitions, 3);
+        assert_eq!(unfiltered_lists, 7);
+
+        let filter_eq_10 = crate::expr::filter::Filter::try_from(("byteField", "=", "10")).unwrap();
+        let selective_pruner =
+            PartitionPruner::new(&[filter_eq_10], &partition_schema, &hudi_configs).unwrap();
+        let (filtered_partitions, filtered_lists) = list_calls_for(selective_pruner).await;
+        assert_eq!(filtered_partitions, 1);
+        assert_eq!(filtered_lists, 3);
+
+        assert!(
+            filtered_lists < unfiltered_lists,
+            "a selective partition filter should prune storage list calls during descent \
+             (unfiltered={unfiltered_lists}, filtered={filtered_lists})"
+        );
     }
 
     #[tokio::test]

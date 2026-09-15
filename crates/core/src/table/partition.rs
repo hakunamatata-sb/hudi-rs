@@ -174,6 +174,71 @@ impl PartitionPruner {
         })
     }
 
+    /// Returns `true` if a partition directory prefix should be descended into.
+    ///
+    /// Unlike `should_include`, `partial_path` may resolve fewer segments than
+    /// the schema has fields (we're mid-descent, not at a leaf yet). Any segment
+    /// this can't safely reason about — not enough schema fields to compare
+    /// against, a single opaque path field (e.g. under a timestamp-based key
+    /// generator, where a segment carries no independently meaningful value),
+    /// a hive-style segment that doesn't parse as `key=value`, or a cast/compare
+    /// error — is treated as unconstrained, never as a reason to reject. Only a
+    /// segment that positively fails an already-resolved filter returns `false`.
+    pub fn should_include_prefix(&self, partial_path: &str) -> bool {
+        if self.and_filters.is_empty() || self.schema.fields().len() <= 1 {
+            return true;
+        }
+
+        let decoded;
+        let partial_path: &str = if self.is_url_encoded {
+            match percent_encoding::percent_decode(partial_path.as_bytes()).decode_utf8() {
+                Ok(d) => {
+                    decoded = d.into_owned();
+                    &decoded
+                }
+                Err(_) => return true,
+            }
+        } else {
+            partial_path
+        };
+
+        let parts: Vec<&str> = if partial_path.is_empty() {
+            Vec::new()
+        } else {
+            partial_path.split('/').collect()
+        };
+        if parts.len() > self.schema.fields().len() {
+            return true;
+        }
+
+        for (field, part) in self.schema.fields().iter().zip(parts.iter()) {
+            let value = if self.is_hive_style {
+                match part.split_once('=') {
+                    Some((name, v)) if name == field.name() => v,
+                    _ => continue,
+                }
+            } else {
+                part
+            };
+            let scalar = match SchemableFilter::cast_value(&[value], field.data_type()) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            for filter in self
+                .and_filters
+                .iter()
+                .filter(|f| f.field.name() == field.name())
+            {
+                if let Ok(result) = filter.apply_comparison(&scalar)
+                    && !result.value(0)
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Transforms user filters on data columns to filters on partition path columns
     /// based on the configured key generator.
     fn transform_filters_for_keygen(
@@ -399,6 +464,113 @@ mod tests {
         assert!(pruner.should_include("date=2023-02-01/category=A/count=100"));
         assert!(!pruner.should_include("date=2022-12-31/category=A/count=10"));
         assert!(!pruner.should_include("date=2023-02-01/category=B/count=10"));
+    }
+
+    #[test]
+    fn test_partition_pruner_should_include_prefix() {
+        let schema = create_test_schema();
+        let configs = create_hudi_configs(true, false);
+
+        let filter_gt_date = Filter::try_from(("date", ">", "2023-01-01")).unwrap();
+        let filter_eq_a = Filter::try_from(("category", "=", "A")).unwrap();
+        let filter_lte_100 = Filter::try_from(("count", "<=", "100")).unwrap();
+
+        let pruner = PartitionPruner::new(
+            &[filter_gt_date, filter_eq_a, filter_lte_100],
+            &schema,
+            &configs,
+        )
+        .unwrap();
+
+        // A resolved segment that already violates its filter is rejected
+        // without needing to resolve the rest of the path.
+        assert!(!pruner.should_include_prefix("date=2022-12-31"));
+        assert!(!pruner.should_include_prefix("date=2023-02-01/category=B"));
+
+        // A resolved segment that satisfies its filter, with later fields not
+        // yet resolved, is not rejected.
+        assert!(pruner.should_include_prefix("date=2023-02-01"));
+        assert!(pruner.should_include_prefix("date=2023-02-01/category=A"));
+        assert!(pruner.should_include_prefix("date=2023-02-01/category=A/count=10"));
+    }
+
+    #[test]
+    fn test_partition_pruner_should_include_prefix_no_filters() {
+        let pruner = PartitionPruner::empty();
+        assert!(pruner.should_include_prefix("date=2022-12-31"));
+        assert!(pruner.should_include_prefix(""));
+    }
+
+    #[test]
+    fn test_partition_pruner_should_include_prefix_malformed_segment_fails_open() {
+        let schema = create_test_schema();
+        let configs = create_hudi_configs(true, false);
+        let filter_eq_a = Filter::try_from(("category", "=", "A")).unwrap();
+        let pruner = PartitionPruner::new(&[filter_eq_a], &schema, &configs).unwrap();
+
+        // A segment that doesn't parse as `key=value` under hive-style
+        // partitioning can't be safely compared, so it must not be rejected.
+        assert!(pruner.should_include_prefix("not-a-kv-pair"));
+    }
+
+    #[test]
+    fn test_partition_pruner_should_include_prefix_non_hive_style() {
+        let schema = create_test_schema();
+        let configs = create_hudi_configs(false, false);
+        let filter_gt_date = Filter::try_from(("date", ">", "2023-01-01")).unwrap();
+        let pruner = PartitionPruner::new(&[filter_gt_date], &schema, &configs).unwrap();
+
+        assert!(!pruner.should_include_prefix("2022-12-31"));
+        assert!(pruner.should_include_prefix("2023-02-01"));
+    }
+
+    #[test]
+    fn test_partition_pruner_should_include_prefix_url_encoded() {
+        let schema = create_test_schema();
+        let configs = create_hudi_configs(true, true);
+        let filter_eq_a = Filter::try_from(("category", "=", "A")).unwrap();
+        let pruner = PartitionPruner::new(&[filter_eq_a], &schema, &configs).unwrap();
+
+        assert!(!pruner.should_include_prefix("date%3D2023-02-01%2Fcategory%3DB"));
+        assert!(pruner.should_include_prefix("date%3D2023-02-01%2Fcategory%3DA"));
+    }
+
+    #[test]
+    fn test_partition_pruner_should_include_prefix_single_field_schema_fails_open() {
+        // Under a timestamp-based key generator, `get_partition_schema` collapses
+        // the schema to a single opaque `_hoodie_partition_path` field (see
+        // `test_partition_pruner_with_timestamp_keygen`), so no per-segment
+        // prefix can be safely evaluated during descent.
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            (
+                "hoodie.keygen.timebased.input.dateformat",
+                "yyyy-MM-dd'T'HH:mm:ssZ",
+            ),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy/MM/dd"),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+        ]);
+        let partition_schema = Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )]);
+        let user_filter = Filter {
+            field: "ts".to_string(),
+            operator: ExprOperator::Gte,
+            values: vec!["2024-01-15T00:00:00Z".to_string()],
+        };
+        let pruner = PartitionPruner::new(&[user_filter], &partition_schema, &configs).unwrap();
+
+        // Even a prefix that would violate the equivalent full-path filter
+        // must fail open, since a single opaque field carries no per-segment
+        // meaning until the whole path is known.
+        assert!(pruner.should_include_prefix("year=2020"));
     }
 
     #[test]
