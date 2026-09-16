@@ -580,7 +580,9 @@ mod tests {
         )
         .unwrap();
         let storage = Storage::new_with_base_url(base_url).unwrap();
-        let leaf_dirs = get_leaf_dirs(&storage, None, &|_: &str| true).await.unwrap();
+        let leaf_dirs = get_leaf_dirs(&storage, None, &|_: &str| true)
+            .await
+            .unwrap();
         assert_eq!(
             leaf_dirs,
             vec![".hoodie", "part1", "part2/part22", "part3/part32/part33"]
@@ -593,7 +595,9 @@ mod tests {
             Url::from_directory_path(canonicalize(Path::new("tests/data/leaf_dir")).unwrap())
                 .unwrap();
         let storage = Storage::new_with_base_url(base_url).unwrap();
-        let leaf_dirs = get_leaf_dirs(&storage, None, &|_: &str| true).await.unwrap();
+        let leaf_dirs = get_leaf_dirs(&storage, None, &|_: &str| true)
+            .await
+            .unwrap();
         assert_eq!(
             leaf_dirs,
             vec![""],
